@@ -1,0 +1,314 @@
+#!/bin/bash
+
+# ==============================================
+# MaiBot Linux 安装程序 v0.4.1
+# By XUESHENG
+# ==============================================
+
+# --- 颜色定义 ---
+export NEWT_COLORS='
+root=,blue
+window=,blue
+border=white,blue
+textbox=white,blue
+button=black,white
+title=white,blue
+actbutton=black,white
+listbox=white,blue
+actlistbox=white,blue
+'
+
+# ANSI 颜色 (用于 echo)
+ANSI_RED='\e[31m'
+ANSI_GREEN='\e[32m'
+ANSI_YELLOW='\e[33m'
+ANSI_BLUE='\e[34m'
+ANSI_RESET='\e[0m'
+
+# --- 配置 ---
+SCRIPT_NAME="MaiBot Linux安装程序"
+VERSION="v0.4.1"
+AUTHOR="By XUESHENG"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- 智能权限检查 ---
+if [[ $EUID -ne 0 ]]; then
+    SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+    
+    if command -v dialog &> /dev/null; then
+        dialog --title "需要权限" --msgbox "此脚本需要 root 权限来执行安装。\n\n将通过 sudo 请求权限。" 10 50
+        clear
+        exec sudo bash "$SCRIPT_PATH"
+    else
+        echo -e "${ANSI_YELLOW}需要 root 权限，正在请求 sudo...${ANSI_RESET}"
+        exec sudo bash "$SCRIPT_PATH"
+    fi
+    exit 1
+fi
+
+# --- 依赖检查 ---
+check_dependencies() {
+    local deps=("dialog" "python3" "curl" "wget")
+    local missing=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        dialog --title "依赖缺失" --msgbox "以下依赖缺失：${missing[*]}\n\n是否自动安装？" 12 60
+        if [[ $? -eq 0 ]]; then
+            if command -v apt-get &> /dev/null; then
+                apt-get update
+                apt-get install -y "${missing[@]}"
+            elif command -v yum &> /dev/null; then
+                yum install -y "${missing[@]}"
+            else
+                dialog --msgbox "无法自动安装依赖，请手动安装。" 8 50
+                exit 1
+            fi
+        else
+            exit 1
+        fi
+    fi
+}
+
+# --- 平滑进度条函数 ---
+smooth_progress() {
+    local current=$1
+    local target=$2
+    local message="$3"
+    local delay=${4:-0.03}
+    
+    for ((i=current; i<=target; i++)); do
+        echo -e "XXX\n$i\n$message\nXXX"
+        sleep $delay
+    done
+}
+
+# --- 读取 requirements.txt ---
+read_requirements() {
+    local req_file="$1"
+    local deps=()
+    
+    if [[ -f "$req_file" ]]; then
+        while IFS= read -r line; do
+            if [[ -n "$line" && ! "$line" =~ ^[[:space:]]*# ]]; then
+                dep_name=$(echo "$line" | cut -d'=' -f1 | cut -d'>' -f1 | cut -d'<' -f1)
+                deps+=("$dep_name")
+            fi
+        done < "$req_file"
+    fi
+    echo "${deps[@]}"
+}
+
+# --- 安装 Python ---
+install_python() {
+    {
+        smooth_progress 0 10 "准备安装环境..."
+        smooth_progress 10 30 "更新软件包列表..."
+        apt update > /dev/null 2>&1
+        
+        smooth_progress 30 60 "安装 Python 3.12..."
+        apt install -y python3.12 python3-pip python3-venv > /dev/null 2>&1
+        
+        smooth_progress 60 80 "配置 Python 环境..."
+        pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ > /dev/null 2>&1
+        
+        smooth_progress 80 100 "完成 Python 安装..."
+        sleep 1
+    } | dialog --title "Python 安装" --gauge "正在安装 Python 3.12..." 12 60 0
+}
+
+# --- 安装依赖（MaiBot + Adapter） ---
+install_all_deps() {
+    if [[ ! -d "bot/MaiBot" ]]; then
+        dialog --msgbox "错误: 未找到 bot/MaiBot 目录" 8 50
+        return 1
+    fi
+    
+    # 安装 MaiBot 依赖
+    local dependencies=($(read_requirements "bot/MaiBot/requirements.txt"))
+    local total_deps=${#dependencies[@]}
+    local current_dep=0
+    
+    {
+        cd bot
+        smooth_progress 0 20 "创建虚拟环境..."
+        python3 -m venv MaiBot/venv > /dev/null 2>&1
+        
+        smooth_progress 20 30 "激活虚拟环境..."
+        source MaiBot/venv/bin/activate
+        
+        smooth_progress 30 40 "进入 MaiBot 目录..."
+        cd MaiBot
+        
+        # 安装 MaiBot 依赖
+        for dep in "${dependencies[@]}"; do
+            current_dep=$((current_dep + 1))
+            local progress=$((40 + (current_dep * 30 / total_deps)))
+            smooth_progress $((progress - 2)) $progress "安装 MaiBot: $dep ($current_dep/$total_deps)"
+            pip install -i https://mirrors.aliyun.com/pypi/simple "$dep" --upgrade > /dev/null 2>&1
+        done
+        
+        # 安装 Adapter 依赖
+        smooth_progress 70 80 "安装 Adapter 依赖..."
+        cd ../MaiBot-Napcat-Adapter
+        if [[ -f "requirements.txt" ]]; then
+            pip install -i https://mirrors.aliyun.com/pypi/simple -r requirements.txt --upgrade > /dev/null 2>&1
+        fi
+        
+        # 自动配置模板
+        smooth_progress 80 90 "配置模板文件..."
+        cd ../MaiBot-Napcat-Adapter
+        cp -n template/template_config.toml config.toml 2>/dev/null
+        
+        cd ../MaiBot
+        mkdir -p config
+        cp -n template/bot_config_template.toml config/bot_config.toml 2>/dev/null
+        cp -n template/template.env .env 2>/dev/null
+        cp -n template/model_config_template.toml config/model_config.toml 2>/dev/null
+        
+        smooth_progress 90 100 "完成依赖安装和配置..."
+        sleep 1
+    } | dialog --title "依赖安装" --gauge "正在安装依赖和配置..." 15 70 0
+}
+
+# --- 安装 Napcat (简化版本，不使用日志监控) ---
+install_napcat() {
+    # 查找 napcat_install 目录
+    local NAPCAT_DIR=""
+    if [[ -d "napcat_install" ]]; then
+        NAPCAT_DIR="napcat_install"
+    elif [[ -d "bot/napcat_install" ]]; then
+        NAPCAT_DIR="bot/napcat_install"
+    else
+        dialog --msgbox "错误: 未找到 napcat_install 目录" 8 50
+        return 1
+    fi
+    
+    {
+        smooth_progress 0 20 "准备安装 Napcat..."
+        smooth_progress 20 40 "进入 Napcat 目录..."
+        
+        cd "$NAPCAT_DIR"
+        
+        smooth_progress 40 60 "运行安装脚本..."
+        # 直接运行安装脚本，不使用后台进程
+        bash napcat.sh --docker n --cli y
+        
+        smooth_progress 60 100 "完成安装..."
+        sleep 1
+    } | dialog --title "Napcat 安装" --gauge "正在安装 Napcat，请耐心等待..." 12 60 0
+    
+    # 检查安装结果
+    if [[ $? -eq 0 ]]; then
+        dialog --msgbox "Napcat 安装完成！" 8 50
+        return 0
+    else
+        dialog --msgbox "Napcat 安装失败，请检查错误信息。" 10 50
+        return 1
+    fi
+}
+
+# --- 运行 MaiBot 配置 ---
+run_maibot_config() {
+    if [[ ! -f "config" ]]; then
+        dialog --msgbox "错误: 未找到 config 脚本" 8 50
+        return 1
+    fi
+    
+    dialog --title "MaiBot 配置" --msgbox "即将运行 MaiBot 配置脚本..." 8 50
+    clear
+    echo -e "${ANSI_GREEN}正在运行 MaiBot 配置...${ANSI_RESET}"
+    echo -e "${ANSI_YELLOW}================================${ANSI_RESET}"
+    bash config
+    echo -e "${ANSI_YELLOW}================================${ANSI_RESET}"
+    echo -e "${ANSI_GREEN}配置完成，按回车键返回主菜单...${ANSI_RESET}"
+    read -p ""
+}
+
+# --- 主安装函数 ---
+main_install() {
+    check_dependencies
+    
+    dialog --title "$SCRIPT_NAME $VERSION" --msgbox "欢迎使用 $SCRIPT_NAME\n\n版本: $VERSION\n$AUTHOR" 12 60
+    
+    # 安装 Python
+    if dialog --title "Python 安装" --yesno "是否安装 Python 3.12 和必要组件？" 8 50; then
+        install_python
+    fi
+    
+    # 安装所有依赖
+    if dialog --title "依赖安装" --yesno "是否安装 MaiBot 和 Adapter 依赖？" 8 50; then
+        install_all_deps
+    fi
+    
+    # 安装 Napcat
+    if dialog --title "Napcat 安装" --yesno "是否安装 Napcat？" 8 50; then
+        install_napcat
+    fi
+    
+    dialog --title "完成" --msgbox "安装完成！\n\n即将运行 MaiBot 配置..." 10 50
+    
+    # 运行配置
+    run_maibot_config
+}
+
+# --- 主菜单 ---
+main_menu() {
+    while true; do
+        choice=$(dialog --clear --backtitle "$SCRIPT_NAME $VERSION" \
+                        --title "主菜单" \
+                        --menu "请选择操作:" 17 60 6 \
+                        "1" "全新安装 MaiBot (全部组件)" \
+                        "2" "仅安装依赖 (MaiBot+Adapter)" \
+                        "3" "仅安装 Napcat" \
+                        "4" "运行 MaiBot 配置" \
+                        "5" "退出" \
+                        2>&1 >/dev/tty)
+        
+        case $? in
+            0)
+                case "$choice" in
+                    "1") 
+                        main_install
+                        ;;
+                    "2") 
+                        install_all_deps
+                        dialog --msgbox "依赖安装完成！" 8 50
+                        ;;
+                    "3") 
+                        install_napcat
+                        ;;
+                    "4") 
+                        run_maibot_config
+                        ;;
+                    "5") break ;;
+                esac
+                ;;
+            1|255) break ;;
+        esac
+    done
+}
+
+# --- 清理函数 ---
+cleanup() {
+    deactivate 2>/dev/null
+    cd "$SCRIPT_DIR" 2>/dev/null
+}
+
+# --- 设置退出陷阱 ---
+trap cleanup EXIT
+
+# --- 主程序 ---
+clear
+main_menu
+
+# --- 退出 ---
+clear
+echo -e "${ANSI_GREEN}感谢使用 $SCRIPT_NAME $VERSION${ANSI_RESET}"
+echo -e "${ANSI_BLUE}安装完成！${ANSI_RESET}"
+exit 0
